@@ -1,0 +1,47 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Publish GUI (win-x64, single file)
+        run: >
+          dotnet publish NetworkScan.Gui/NetworkScan.Gui.csproj
+          -c Release -r win-x64 --self-contained false
+          -p:PublishSingleFile=true -p:DebugType=None -o ${{ github.workspace }}\artifacts\gui
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetworkScan-GUI-win-x64
+          path: artifacts/gui/**
+
+      - name: Create Release (tagged builds)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/gui/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

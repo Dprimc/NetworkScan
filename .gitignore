@@ -13,5 +13,9 @@
 *.log
 /gui_run.log
 
+# CI artifacts
+artifacts/
+publish/
+
 # Publish outputs
 **/publish/
