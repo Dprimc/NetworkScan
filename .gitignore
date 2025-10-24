@@ -1,0 +1,17 @@
+# Build outputs
+**/bin/
+**/obj/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Logs
+*.log
+/gui_run.log
+
+# Publish outputs
+**/publish/
