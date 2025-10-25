@@ -313,6 +313,13 @@ public static class NetworkScanner
                     // Hostname via reverse DNS
                     r.Hostname = await TryReverseDnsAsync(r.Address, opts.TimeoutMs, ct) ?? string.Empty;
 
+                    // mDNS reverse lookup (common for .local devices)
+                    if (string.IsNullOrWhiteSpace(r.Hostname))
+                    {
+                        var mdns = await TryMdnsPtrAsync(r.Address, Math.Max(800, opts.TimeoutMs), ct);
+                        if (!string.IsNullOrWhiteSpace(mdns)) r.Hostname = mdns!;
+                    }
+
                     // NetBIOS (NBNS) fallback on Windows networks
                     if (string.IsNullOrWhiteSpace(r.Hostname))
                     {
@@ -698,6 +705,127 @@ public static class NetworkScanner
             {
                 var title = WebUtility.HtmlDecode(m.Groups[1].Value).Trim();
                 if (!string.IsNullOrWhiteSpace(title)) return title;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // mDNS reverse lookup for IPv4: queries <reversed>.in-addr.arpa PTR to 224.0.0.251:5353
+    static async Task<string?> TryMdnsPtrAsync(IPAddress ip, int timeoutMs, CancellationToken ct)
+    {
+        try
+        {
+            if (ip.AddressFamily != AddressFamily.InterNetwork) return null;
+            using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
+            udp.Client.ReceiveTimeout = Math.Max(800, timeoutMs);
+            udp.Client.SendTimeout = Math.Max(800, timeoutMs);
+            var mcast = new IPEndPoint(IPAddress.Parse("224.0.0.251"), 5353);
+
+            static byte[] Build(string rev)
+            {
+                var buf = new List<byte>(256);
+                void W(ushort v) { buf.Add((byte)(v >> 8)); buf.Add((byte)(v & 0xFF)); }
+                W(0); // ID must be 0 in mDNS
+                W(0x0000); // flags query
+                W(0x0001); // QDCOUNT
+                W(0x0000); W(0x0000); W(0x0000); // AN, NS, AR = 0
+                foreach (var label in rev.Split('.'))
+                {
+                    var bytes = Encoding.ASCII.GetBytes(label);
+                    buf.Add((byte)bytes.Length);
+                    buf.AddRange(bytes);
+                }
+                buf.Add(0x00); // end
+                W(0x000C); // TYPE PTR
+                W(0x0001); // CLASS IN
+                return buf.ToArray();
+            }
+
+            static string ReversePtr(IPAddress a)
+            {
+                var b = a.GetAddressBytes();
+                return $"{b[3]}.{b[2]}.{b[1]}.{b[0]}.in-addr.arpa";
+            }
+
+            var payload = Build(ReversePtr(ip));
+            await udp.SendAsync(payload, payload.Length, mcast);
+
+            var recvTask = udp.ReceiveAsync();
+            var completed = await Task.WhenAny(recvTask.AsTask(), Task.Delay(timeoutMs, ct));
+            if (completed != recvTask.AsTask()) return null;
+            var resp = recvTask.Result;
+            var name = ParseDnsPtr(resp.Buffer);
+            if (!string.IsNullOrWhiteSpace(name)) return name;
+        }
+        catch { }
+        return null;
+    }
+
+    static string? ParseDnsPtr(byte[] buf)
+    {
+        try
+        {
+            if (buf.Length < 12) return null;
+            // Skip header
+            int i = 12;
+            // Skip QNAME
+            int skipName(int o)
+            {
+                int p = o;
+                int guard = 0;
+                while (p < buf.Length && guard++ < 256)
+                {
+                    byte len = buf[p++];
+                    if (len == 0) break;
+                    if ((len & 0xC0) == 0xC0) { p++; break; } // pointer
+                    p += len;
+                }
+                return p;
+            }
+            int readName(int o, out string name)
+            {
+                var labels = new List<string>();
+                int p = o; int jumped = -1; int guard = 0;
+                while (p < buf.Length && guard++ < 256)
+                {
+                    byte len = buf[p++];
+                    if (len == 0) break;
+                    if ((len & 0xC0) == 0xC0)
+                    {
+                        int ptr = ((len & 0x3F) << 8) | buf[p++];
+                        if (jumped < 0) jumped = p;
+                        p = ptr;
+                        continue;
+                    }
+                    if (p + len > buf.Length) { name = string.Empty; return o; }
+                    labels.Add(Encoding.ASCII.GetString(buf, p, len));
+                    p += len;
+                }
+                name = string.Join('.', labels);
+                return jumped >= 0 ? jumped : p;
+            }
+
+            i = skipName(i);
+            i += 4; // QTYPE/QCLASS
+            if (i >= buf.Length) return null;
+
+            // Answers
+            // Find first PTR answer
+            int p2 = i;
+            for (int cnt = 0; cnt < 20 && p2 + 10 < buf.Length; cnt++)
+            {
+                p2 = skipName(p2); if (p2 + 10 > buf.Length) break;
+                ushort type = (ushort)((buf[p2] << 8) | buf[p2 + 1]); p2 += 2;
+                p2 += 2; // class
+                p2 += 4; // ttl
+                ushort rdlen = (ushort)((buf[p2] << 8) | buf[p2 + 1]); p2 += 2;
+                if (type == 12) // PTR
+                {
+                    readName(p2, out var target);
+                    if (!string.IsNullOrWhiteSpace(target)) return target;
+                }
+                p2 += rdlen;
             }
         }
         catch { }
