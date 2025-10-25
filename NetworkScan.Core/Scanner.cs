@@ -316,7 +316,13 @@ public static class NetworkScanner
                     // NetBIOS (NBNS) fallback on Windows networks
                     if (string.IsNullOrWhiteSpace(r.Hostname))
                     {
-                        var (nbName, nbMac) = await TryNetBiosAsync(r.Address, Math.Max(500, opts.TimeoutMs), ct);
+                        // Prefer direct NBNS UDP query; fallback to nbtstat tool if needed
+                        var (nbName, nbMac) = await TryNetBiosUdpAsync(r.Address, Math.Max(600, opts.TimeoutMs), ct);
+                        if (string.IsNullOrWhiteSpace(nbName))
+                        {
+                            var legacy = await TryNetBiosAsync(r.Address, Math.Max(600, opts.TimeoutMs), ct);
+                            nbName = legacy.name; nbMac = legacy.mac;
+                        }
                         if (!string.IsNullOrWhiteSpace(nbName)) r.Hostname = nbName!;
                         if (string.IsNullOrWhiteSpace(r.MacAddress) && !string.IsNullOrWhiteSpace(nbMac)) r.MacAddress = nbMac!;
                     }
@@ -335,8 +341,17 @@ public static class NetworkScanner
                         }
                     }
 
-                    // HTTP header if web ports open and vendor/model still empty
-                    if (string.IsNullOrWhiteSpace(r.Vendor) || string.IsNullOrWhiteSpace(r.Model))
+                    // SSDP/UPnP discovery can reveal vendor/model/friendly name
+                    if (string.IsNullOrWhiteSpace(r.Vendor) || string.IsNullOrWhiteSpace(r.Model) || string.IsNullOrWhiteSpace(r.Hostname))
+                    {
+                        var upnp = await TrySsdpAsync(r.Address, Math.Max(1200, opts.TimeoutMs), ct);
+                        if (!string.IsNullOrWhiteSpace(upnp.friendlyName) && string.IsNullOrWhiteSpace(r.Hostname)) r.Hostname = upnp.friendlyName!;
+                        if (!string.IsNullOrWhiteSpace(upnp.manufacturer) && string.IsNullOrWhiteSpace(r.Vendor)) r.Vendor = upnp.manufacturer!;
+                        if (!string.IsNullOrWhiteSpace(upnp.model) && string.IsNullOrWhiteSpace(r.Model)) r.Model = upnp.model!;
+                    }
+
+                    // HTTP header/title if web ports open and vendor/model still empty
+                    if (string.IsNullOrWhiteSpace(r.Vendor) || string.IsNullOrWhiteSpace(r.Model) || string.IsNullOrWhiteSpace(r.Hostname))
                     {
                         var webPort = new[] { 80, 8080, 8000, 443 }.FirstOrDefault(p => r.OpenPorts.Contains(p));
                         if (webPort != 0)
@@ -347,6 +362,10 @@ public static class NetworkScanner
                                 if (string.IsNullOrWhiteSpace(r.Model)) r.Model = info;
                                 if (string.IsNullOrWhiteSpace(r.Vendor)) r.Vendor = info.Split('/', ' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
                             }
+
+                            // Try to fetch HTML title for friendlier device name (printers/NAS)
+                            var title = await TryHttpTitleAsync(r.Address, webPort, Math.Max(1500, opts.TimeoutMs), ct);
+                            if (!string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(r.Hostname)) r.Hostname = title!;
                         }
                     }
 
@@ -657,6 +676,210 @@ public static class NetworkScanner
         }
         catch { }
         return null;
+    }
+
+    static async Task<string?> TryHttpTitleAsync(IPAddress ip, int port, int timeoutMs, CancellationToken ct)
+    {
+        try
+        {
+            var handler = new SocketsHttpHandler
+            {
+                AllowAutoRedirect = true,
+                SslOptions = new System.Net.Security.SslClientAuthenticationOptions { RemoteCertificateValidationCallback = (_, __, ___, ____) => true }
+            };
+            using var http = new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(timeoutMs) };
+            var scheme = port == 443 ? "https" : "http";
+            var url = $"{scheme}://{ip}/";
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct);
+            var html = await resp.Content.ReadAsStringAsync(ct);
+            var m = Regex.Match(html ?? string.Empty, @"<title>\s*(.*?)\s*</title>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+            if (m.Success)
+            {
+                var title = WebUtility.HtmlDecode(m.Groups[1].Value).Trim();
+                if (!string.IsNullOrWhiteSpace(title)) return title;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Direct NBNS (NetBIOS Name Service) Node Status query to UDP/137
+    static async Task<(string? name, string? mac)> TryNetBiosUdpAsync(IPAddress ip, int timeoutMs, CancellationToken ct)
+    {
+        try
+        {
+            using var udp = new UdpClient();
+            udp.Client.ReceiveTimeout = Math.Max(500, timeoutMs);
+            udp.Client.SendTimeout = Math.Max(500, timeoutMs);
+            var endpoint = new IPEndPoint(ip, 137);
+
+            var txId = (ushort)Random.Shared.Next(0, 0xFFFF);
+            var payload = BuildNbnsNodeStatusRequest(txId);
+            await udp.SendAsync(payload, payload.Length, endpoint);
+
+            var recvTask = udp.ReceiveAsync();
+            var completed = await Task.WhenAny(recvTask.AsTask(), Task.Delay(timeoutMs, ct));
+            if (completed != recvTask.AsTask()) return (null, null);
+            var resp = recvTask.Result;
+            if (!resp.RemoteEndPoint.Address.Equals(ip)) return (null, null);
+            return ParseNbnsNodeStatusResponse(resp.Buffer);
+        }
+        catch { return (null, null); }
+    }
+
+    static byte[] BuildNbnsNodeStatusRequest(ushort txId)
+    {
+        // Header: ID, Flags(0x0000), QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        var buf = new List<byte>(100);
+        void W(ushort v) { buf.Add((byte)(v >> 8)); buf.Add((byte)(v & 0xFF)); }
+        W(txId); W(0x0000); W(0x0001); W(0x0000); W(0x0000); W(0x0000);
+        // Question name: special '*' encoded to NetBIOS name (32 chars), label length 0x20, end 0x00
+        var encoded = EncodeNetBiosName("*");
+        buf.Add(0x20); buf.AddRange(Encoding.ASCII.GetBytes(encoded)); buf.Add(0x00);
+        W(0x0021); // TYPE = NBSTAT
+        W(0x0001); // CLASS = IN
+        return buf.ToArray();
+    }
+
+    static string EncodeNetBiosName(string name)
+    {
+        // Pad to 15 chars, add 0x00 suffix type; map to two ASCII chars per nibble (RFC 1002)
+        var bytes = new byte[16];
+        var raw = Encoding.ASCII.GetBytes((name ?? string.Empty).ToUpperInvariant());
+        int i = 0;
+        for (; i < Math.Min(15, raw.Length); i++) bytes[i] = raw[i];
+        for (; i < 15; i++) bytes[i] = (byte)' '; // pad spaces
+        bytes[15] = 0x00; // suffix
+
+        Span<char> outChars = stackalloc char[32];
+        for (int j = 0; j < 16; j++)
+        {
+            byte b = bytes[j];
+            outChars[j * 2 + 0] = (char)('A' + ((b >> 4) & 0x0F));
+            outChars[j * 2 + 1] = (char)('A' + (b & 0x0F));
+        }
+        return new string(outChars);
+    }
+
+    static (string? name, string? mac) ParseNbnsNodeStatusResponse(byte[] buf)
+    {
+        try
+        {
+            if (buf.Length < 57) return (null, null);
+            // Skip header (12) + question (var). Find the number of names from the data part.
+            // The response format: Header, Question (optional), Answer RR with RDATA containing
+            // NAME COUNT (1 byte), then NAME entries and a 6-byte Unit ID (MAC).
+
+            // Heuristic parse: find the first occurrence of a 0x00 length label terminator followed by TYPE=0x0021
+            int i = 12; // start after header
+            // Skip QNAME
+            if (i >= buf.Length) return (null, null);
+            while (i < buf.Length && buf[i] != 0x00) i++;
+            i += 1; // null
+            if (i + 8 > buf.Length) return (null, null);
+            // TYPE, CLASS, TTL(4), RDLENGTH(2)
+            i += 8; // TYPE/CLASS/TTL
+            if (i + 2 > buf.Length) return (null, null);
+            ushort rdlen = (ushort)((buf[i] << 8) | buf[i + 1]);
+            i += 2;
+            if (i + rdlen > buf.Length) rdlen = (ushort)Math.Max(0, buf.Length - i);
+            int start = i;
+            if (start + 1 > buf.Length) return (null, null);
+            int nameCount = buf[start];
+            i = start + 1;
+            string? best = null;
+            for (int n = 0; n < nameCount && i + 18 <= buf.Length; n++)
+            {
+                var nameBytes = new byte[15];
+                Array.Copy(buf, i, nameBytes, 0, 15); i += 15;
+                byte suffix = buf[i++];
+                byte flags1 = buf[i++]; byte flags2 = buf[i++]; // 2 bytes flags
+                // Flags bit 15 indicates GROUP; we want UNIQUE
+                bool isGroup = (flags1 & 0x80) != 0;
+                var name = Encoding.ASCII.GetString(nameBytes).Trim();
+                string code = suffix.ToString("X2");
+                if (!isGroup)
+                {
+                    if (code == "20") { best = name; break; }
+                    if (best == null && code == "00") best = name;
+                }
+            }
+            // Skip to Unit ID (MAC): it's at the end of RDATA: 6 bytes
+            int end = start + rdlen;
+            string? mac = null;
+            if (end - 6 >= 0 && end <= buf.Length)
+            {
+                var macBytes = new byte[6];
+                Array.Copy(buf, end - 6, macBytes, 0, 6);
+                mac = string.Join(":", macBytes.Select(b => b.ToString("x2")));
+            }
+            return (best, mac);
+        }
+        catch { return (null, null); }
+    }
+
+    // Simple SSDP/UPnP probe to enrich vendor/model and friendly name
+    static async Task<(string? manufacturer, string? model, string? friendlyName)> TrySsdpAsync(IPAddress ip, int timeoutMs, CancellationToken ct)
+    {
+        try
+        {
+            using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0));
+            udp.Client.ReceiveTimeout = Math.Max(800, timeoutMs);
+            udp.Client.SendTimeout = Math.Max(800, timeoutMs);
+            var dst = new IPEndPoint(IPAddress.Parse("239.255.255.250"), 1900);
+            var req = "M-SEARCH * HTTP/1.1\r\n" +
+                      "HOST: 239.255.255.250:1900\r\n" +
+                      "MAN: \"ssdp:discover\"\r\n" +
+                      "MX: 1\r\n" +
+                      "ST: ssdp:all\r\n\r\n";
+            var data = Encoding.ASCII.GetBytes(req);
+            await udp.SendAsync(data, data.Length, dst);
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            string? location = null; string? server = null;
+            while (DateTime.UtcNow < deadline)
+            {
+                var wait = (int)Math.Max(50, (deadline - DateTime.UtcNow).TotalMilliseconds);
+                var t = udp.ReceiveAsync();
+                var c = await Task.WhenAny(t.AsTask(), Task.Delay(wait, ct));
+                if (c != t.AsTask()) break;
+                var resp = t.Result;
+                if (!resp.RemoteEndPoint.Address.Equals(ip)) continue;
+                var text = Encoding.UTF8.GetString(resp.Buffer);
+                foreach (var line in text.Split(new[] {"\r\n"}, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (line.StartsWith("LOCATION:", StringComparison.OrdinalIgnoreCase)) location = line.Substring(9).Trim();
+                    else if (line.StartsWith("SERVER:", StringComparison.OrdinalIgnoreCase)) server = line.Substring(7).Trim();
+                }
+                break;
+            }
+
+            string? manufacturer = null, model = null, friendly = null;
+            if (!string.IsNullOrWhiteSpace(server))
+            {
+                // Use SERVER header as a hint e.g., "Linux/3.14 UPnP/1.0 product/1.0"
+                model ??= server;
+            }
+            if (!string.IsNullOrWhiteSpace(location))
+            {
+                try
+                {
+                    using var http = new HttpClient() { Timeout = TimeSpan.FromMilliseconds(Math.Max(800, timeoutMs)) };
+                    var xml = await http.GetStringAsync(location, ct);
+                    manufacturer = Regex.Match(xml, @"<manufacturer>\s*(.*?)\s*</manufacturer>", RegexOptions.IgnoreCase | RegexOptions.Singleline).Groups[1].Value.Trim();
+                    model = (Regex.Match(xml, @"<modelName>\s*(.*?)\s*</modelName>", RegexOptions.IgnoreCase | RegexOptions.Singleline).Groups[1].Value.Trim())
+                            ?? model;
+                    friendly = Regex.Match(xml, @"<friendlyName>\s*(.*?)\s*</friendlyName>", RegexOptions.IgnoreCase | RegexOptions.Singleline).Groups[1].Value.Trim();
+                    if (string.IsNullOrWhiteSpace(manufacturer)) manufacturer = null;
+                    if (string.IsNullOrWhiteSpace(model)) model = null;
+                    if (string.IsNullOrWhiteSpace(friendly)) friendly = null;
+                }
+                catch { }
+            }
+            return (manufacturer, model, friendly);
+        }
+        catch { return (null, null, null); }
     }
 
     static Dictionary<IPAddress, string> GetArpCache()
