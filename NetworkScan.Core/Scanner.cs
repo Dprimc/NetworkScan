@@ -752,9 +752,9 @@ public static class NetworkScanner
             await udp.SendAsync(payload, payload.Length, mcast);
 
             var recvTask = udp.ReceiveAsync();
-            var completed = await Task.WhenAny(recvTask.AsTask(), Task.Delay(timeoutMs, ct));
-            if (completed != recvTask.AsTask()) return null;
-            var resp = recvTask.Result;
+            var completed = await Task.WhenAny(recvTask, Task.Delay(timeoutMs, ct));
+            if (completed != recvTask) return null;
+            var resp = await recvTask;
             var name = ParseDnsPtr(resp.Buffer);
             if (!string.IsNullOrWhiteSpace(name)) return name;
         }
@@ -847,9 +847,9 @@ public static class NetworkScanner
             await udp.SendAsync(payload, payload.Length, endpoint);
 
             var recvTask = udp.ReceiveAsync();
-            var completed = await Task.WhenAny(recvTask.AsTask(), Task.Delay(timeoutMs, ct));
-            if (completed != recvTask.AsTask()) return (null, null);
-            var resp = recvTask.Result;
+            var completed = await Task.WhenAny(recvTask, Task.Delay(timeoutMs, ct));
+            if (completed != recvTask) return (null, null);
+            var resp = await recvTask;
             if (!resp.RemoteEndPoint.Address.Equals(ip)) return (null, null);
             return ParseNbnsNodeStatusResponse(resp.Buffer);
         }
@@ -970,9 +970,9 @@ public static class NetworkScanner
             {
                 var wait = (int)Math.Max(50, (deadline - DateTime.UtcNow).TotalMilliseconds);
                 var t = udp.ReceiveAsync();
-                var c = await Task.WhenAny(t.AsTask(), Task.Delay(wait, ct));
-                if (c != t.AsTask()) break;
-                var resp = t.Result;
+                var c = await Task.WhenAny(t, Task.Delay(wait, ct));
+                if (c != t) break;
+                var resp = await t;
                 if (!resp.RemoteEndPoint.Address.Equals(ip)) continue;
                 var text = Encoding.UTF8.GetString(resp.Buffer);
                 foreach (var line in text.Split(new[] {"\r\n"}, StringSplitOptions.RemoveEmptyEntries))
