@@ -313,6 +313,14 @@ public static class NetworkScanner
                     // Hostname via reverse DNS
                     r.Hostname = await TryReverseDnsAsync(r.Address, opts.TimeoutMs, ct) ?? string.Empty;
 
+                    // NetBIOS (NBNS) fallback on Windows networks
+                    if (string.IsNullOrWhiteSpace(r.Hostname))
+                    {
+                        var (nbName, nbMac) = await TryNetBiosAsync(r.Address, Math.Max(500, opts.TimeoutMs), ct);
+                        if (!string.IsNullOrWhiteSpace(nbName)) r.Hostname = nbName!;
+                        if (string.IsNullOrWhiteSpace(r.MacAddress) && !string.IsNullOrWhiteSpace(nbMac)) r.MacAddress = nbMac!;
+                    }
+
                     // SNMP if 161 open
                     if (r.OpenPorts.Contains(161))
                     {
@@ -549,6 +557,68 @@ public static class NetworkScanner
         }
         catch { }
         return null;
+    }
+
+    // Lightweight NetBIOS name lookup using the built-in nbtstat tool (Windows environments)
+    // Returns: (hostname, mac) when available
+    static async Task<(string? name, string? mac)> TryNetBiosAsync(IPAddress ip, int timeoutMs, CancellationToken ct)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "nbtstat",
+                Arguments = $"-A {ip}",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return (null, null);
+
+            var readTask = p.StandardOutput.ReadToEndAsync();
+            var errTask = p.StandardError.ReadToEndAsync();
+            var completed = await Task.WhenAny(Task.WhenAll(readTask, errTask), Task.Delay(timeoutMs, ct));
+            if (completed is not Task t || t != Task.WhenAll(readTask, errTask))
+            {
+                try { if (!p.HasExited) p.Kill(true); } catch { }
+                return (null, null);
+            }
+            // ensure process ended
+            try { p.WaitForExit(Math.Max(250, timeoutMs / 2)); } catch { }
+
+            var output = (readTask.Result ?? string.Empty).Replace("\r", "");
+            if (string.IsNullOrWhiteSpace(output)) return (null, null);
+
+            string? mac = null;
+            foreach (var line in output.Split('\n'))
+            {
+                var mMac = Regex.Match(line, @"MAC Address\s*=\s*([0-9A-Fa-f:-]{12,})");
+                if (mMac.Success)
+                {
+                    mac = mMac.Groups[1].Value.Replace('-', ':').ToLowerInvariant();
+                    break;
+                }
+            }
+
+            // Prefer <20> UNIQUE (Server Service), then <00> UNIQUE (Workstation)
+            string? best = null;
+            foreach (var line in output.Split('\n'))
+            {
+                var m = Regex.Match(line, @"^\s*([^\s<]{1,15})\s+<([0-9A-Fa-f]{2})>\s+(UNIQUE|GROUP)\s+Registered");
+                if (!m.Success) continue;
+                var name = m.Groups[1].Value.Trim();
+                var code = m.Groups[2].Value.ToUpperInvariant();
+                var kind = m.Groups[3].Value.ToUpperInvariant();
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                if (code == "20" && kind == "UNIQUE") { best = name; break; }
+                if (best == null && code == "00" && kind == "UNIQUE") best = name;
+            }
+
+            return (best, mac);
+        }
+        catch { return (null, null); }
     }
 
     static async Task<(string? sysName, string? sysDescr)> TrySnmpAsync(IPAddress ip, int timeoutMs, CancellationToken ct)
