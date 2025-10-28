@@ -512,6 +512,8 @@ public static class NetworkScanner
             ["F8B599"] = "OnePlus", ["B4F1DA"] = "OnePlus",
             // Google (Pixel)
             ["3C286D"] = "Google", ["7C2EBD"] = "Google",
+            // Intel
+            ["A434D9"] = "Intel Corp",
         };
 
         private static readonly Dictionary<string, string> Cache = new(StringComparer.OrdinalIgnoreCase);
